@@ -9,38 +9,48 @@ app.use(express.json());
 
 const SPREADSHEET_ID = '1EySpWSE1NosfWziH4voX5PsdtYrtxrCmWn3sMdSkYLg';
 const API_KEY = 'AIzaSyAebz-xL67LSPO4VCb7g9AmK6X25bwLMho';
-const sheets = google.sheets({ version: 'v4', auth: API_KEY });
+
+// For read-only operations (like search)
+const readOnlySheets = google.sheets({ version: 'v4', auth: API_KEY });
+
+// For write operations - using OAuth2
+const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
+const auth = new google.auth.GoogleAuth({
+  keyFile: 'credentials.json', // You need to create this file with your service account credentials
+  scopes: SCOPES
+});
+
+// Function to get authenticated client
+async function getAuthenticatedClient() {
+  const authClient = await auth.getClient();
+  return google.sheets({ version: 'v4', auth: authClient });
+}
 
 function normalizeName(name) {
-    // Remove all punctuation marks and convert to lowercase
+    // Same function as before
     name = name
-        .replace(/[^\w\s]/g, '') // Remove all non-alphanumeric characters (punctuation)
-        .replace(/\s+/g, ' ')    // Replace multiple spaces with a single space
-        .trim()                 // Trim leading and trailing spaces
-        .toLowerCase();         // Convert to lowercase
+        .replace(/[^\w\s]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
 
-    // Extract the "Class of" year
     const classOfMatch = name.match(/\bclass of (\d{4})\b/);
     const classOfYear = classOfMatch ? classOfMatch[1] : null;
 
-    // Remove the "Class of" part from the name
     name = name.replace(/\bclass of \d{4}\b/g, '').trim();
 
-    // Handle names with commas (e.g., "Tserakhava, Anastasiya")
     if (name.includes(',')) {
         const [lastName, firstName] = name.split(',').map(part => part.trim());
-        name = `${firstName} ${lastName}`; // Reorder to "FirstName LastName"
+        name = `${firstName} ${lastName}`;
     } else {
-        // Handle names without commas (e.g., "Tserakhava Anastasiya")
         const parts = name.split(' ');
         if (parts.length >= 2) {
-            const lastName = parts[0]; // First part is the last name
-            const firstName = parts.slice(1).join(' '); // Rest is the first name
-            name = `${firstName} ${lastName}`; // Reorder to "FirstName LastName"
+            const lastName = parts[0];
+            const firstName = parts.slice(1).join(' ');
+            name = `${firstName} ${lastName}`;
         }
     }
 
-    // Add the "Class of" year back to the name
     if (classOfYear) {
         name = `${name} class of ${classOfYear}`;
     }
@@ -49,7 +59,7 @@ function normalizeName(name) {
 }
 
 async function getSheetData(sheetName) {
-    const response = await sheets.spreadsheets.values.get({
+    const response = await readOnlySheets.spreadsheets.values.get({
         spreadsheetId: SPREADSHEET_ID,
         range: 'MasterSheet',
     });
@@ -57,28 +67,35 @@ async function getSheetData(sheetName) {
     return response.data.values;
 }
 
+async function getNextRowNumber() {
+    try {
+        const data = await getSheetData('MasterSheet');
+        return data.length > 1 ? parseInt(data[data.length - 1][0]) + 1 : 1;
+    } catch (err) {
+        console.error('Error getting next row number:', err);
+        throw err;
+    }
+}
+
 app.post('/api/search', async (req, res) => {
     const { name } = req.body;
-    console.log(`Searching for name: "${name}"`); // Log the name being searched
+    console.log(`Searching for name: "${name}"`);
 
     try {
         const data = await getSheetData('MasterSheet');
         console.log('Fetched data:', data);
 
-        // Normalize the user's input
-        const normalizedUserName = name; // The name is already normalized by the frontend
+        const normalizedUserName = name;
 
-        // Skip the first row (headers) and filter rows that match the normalized name
         const matchingRows = data.slice(1).filter(row => {
-            const rowName = row[7]; // Assuming 'name' is in the 8th column (index 7)
+            const rowName = row[7];
             if (!rowName) {
                 console.warn('Row with missing name:', row);
                 return false;
             }
 
-            // Normalize the name from the sheet
             const normalizedRowName = normalizeName(rowName);
-            console.log(`Comparing "${normalizedRowName}" with "${normalizedUserName}"`); // Log comparison
+            console.log(`Comparing "${normalizedRowName}" with "${normalizedUserName}"`);
             return normalizedRowName === normalizedUserName;
         });
 
@@ -86,22 +103,81 @@ app.post('/api/search', async (req, res) => {
 
         if (matchingRows.length > 0) {
             const results = matchingRows.map(row => ({
-                num: row[0],           // num
-                date: row[1],          // Date
-                location: row[2],      // Location
-                gpsCoordinates: row[3], // GPS Coordinates
-                typeOfActivity: row[4], // Type of Activity
-                species: row[5],       // Species
-                remarks: row[6],       // Remarks
-                name: row[7],          // name (original, non-normalized)
+                num: row[0],
+                date: row[1],
+                location: row[2],
+                gpsCoordinates: row[3],
+                typeOfActivity: row[4],
+                species: row[5],
+                remarks: row[6],
+                name: row[7],
             }));
-            res.json({ name: matchingRows[0][7], results }); // Return the original name for display
+            res.json({ name: matchingRows[0][7], results });
         } else {
             res.status(404).json({ error: 'Name not found' });
         }
     } catch (err) {
         console.error('Error in /api/search:', err);
         res.status(500).json({ error: 'Failed to fetch data' });
+    }
+});
+
+app.post('/api/add-record', async (req, res) => {
+    const { date, location, gpsCoordinates, typeOfActivity, species, remarks, name } = req.body;
+    
+    console.log('Adding new tree planting record:', req.body);
+    
+    try {
+        // Validate required fields
+        if (!date || !location || !species || !name) {
+            return res.status(400).json({ error: 'Missing required fields: date, location, species, and name are required' });
+        }
+        
+        // Get the next row number
+        const nextRowNum = await getNextRowNumber();
+        
+        // Prepare the new row data
+        const newRow = [
+            nextRowNum.toString(),
+            date,
+            location,
+            gpsCoordinates || '',
+            typeOfActivity || 'Tree Planting',
+            species,
+            remarks || '',
+            name,
+        ];
+        
+        // Get authenticated client for write operations
+        const sheetsClient = await getAuthenticatedClient();
+        
+        // Append the new row to the spreadsheet
+        await sheetsClient.spreadsheets.values.append({
+            spreadsheetId: SPREADSHEET_ID,
+            range: 'MasterSheet',
+            valueInputOption: 'USER_ENTERED',
+            insertDataOption: 'INSERT_ROWS',
+            resource: {
+                values: [newRow]
+            },
+        });
+        
+        res.status(201).json({ 
+            message: 'Tree planting record added successfully',
+            record: {
+                num: nextRowNum,
+                date,
+                location,
+                gpsCoordinates: gpsCoordinates || '',
+                typeOfActivity: typeOfActivity || 'Tree Planting',
+                species,
+                remarks: remarks || '',
+                name
+            }
+        });
+    } catch (err) {
+        console.error('Error in /api/add-record:', err);
+        res.status(500).json({ error: 'Failed to add record: ' + err.message });
     }
 });
 
